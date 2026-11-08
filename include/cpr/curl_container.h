@@ -1,5 +1,5 @@
-#ifndef CURL_CONTAINER_H
-#define CURL_CONTAINER_H
+#ifndef CPR_CURL_CONTAINER_H
+#define CPR_CURL_CONTAINER_H
 
 #include <initializer_list>
 #include <memory>
@@ -12,18 +12,14 @@
 namespace cpr {
 
 struct Parameter {
-    Parameter(const std::string& p_key, const std::string& p_value) : key{p_key}, value{p_value} {}
-    Parameter(std::string&& p_key, std::string&& p_value)
-            : key{std::move(p_key)}, value{std::move(p_value)} {}
+    Parameter(std::string p_key, std::string p_value) : key{std::move(p_key)}, value{std::move(p_value)} {}
 
     std::string key;
     std::string value;
 };
 
 struct Pair {
-    Pair(const std::string& p_key, const std::string& p_value) : key(p_key), value(p_value) {}
-    Pair(std::string&& p_key, std::string&& p_value)
-            : key(std::move(p_key)), value(std::move(p_value)) {}
+    Pair(std::string p_key, std::string p_value) : key(std::move(p_key)), value(std::move(p_value)) {}
 
     std::string key;
     std::string value;
@@ -39,12 +35,22 @@ class CurlContainer {
     bool encode = true;
 
     CurlContainer() = default;
-    CurlContainer(const std::initializer_list<T>&);
+    CurlContainer(const std::initializer_list<T>& /*containerList*/);
 
-    void Add(const std::initializer_list<T>&);
-    void Add(const T&);
+    void Add(const std::initializer_list<T>& /*containerList*/);
+    void Add(const T& /*element*/);
 
-    const std::string GetContent(const CurlHolder&) const;
+    /**
+     * Returns the URL using curl_easy_escape(...) for escaping the given parameters.
+     * Requires `CurlHolder`.
+     **/
+    [[nodiscard]] const std::string GetContent(const CurlHolder& /*holder*/) const;
+
+    /**
+     * Returns the URL while ignoring `encode`. This allows calling without
+     * active `CurlHolder`.
+     **/
+    [[nodiscard]] const std::string GetContent() const;
 
   protected:
     std::vector<T> containerList_;
@@ -52,4 +58,4 @@ class CurlContainer {
 
 } // namespace cpr
 
-#endif //
+#endif // CPR_CURL_CONTAINER_H

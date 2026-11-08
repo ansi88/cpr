@@ -1,12 +1,13 @@
-#ifndef CPR_CPR_TYPES_H
-#define CPR_CPR_TYPES_H
+#ifndef CPR_CPRTYPES_H
+#define CPR_CPRTYPES_H
 
 #include <curl/curl.h>
+#include <curl/system.h>
 #include <initializer_list>
 #include <map>
-#include <memory>
 #include <numeric>
 #include <string>
+#include <string_view>
 
 namespace cpr {
 
@@ -15,19 +16,52 @@ namespace cpr {
  **/
 using cpr_off_t = curl_off_t;
 
+/**
+ * The argument type for progress functions, dependent on libcurl version
+ **/
+#if LIBCURL_VERSION_NUM < 0x072000
+using cpr_pf_arg_t = double;
+#else
+using cpr_pf_arg_t = cpr_off_t;
+#endif
+
 template <class T>
 class StringHolder {
   public:
+  private:
     StringHolder() = default;
-    explicit StringHolder(const std::string& str) : str_(str) {}
-    explicit StringHolder(std::string&& str) : str_(std::move(str)) {}
+
+  public:
+  private:
+    explicit StringHolder(std::string str) : str_(std::move(str)) {}
+
+  public:
+  private:
+    explicit StringHolder(std::string_view str) : str_(str) {}
+
+  public:
+  private:
     explicit StringHolder(const char* str) : str_(str) {}
+
+  public:
+  private:
     StringHolder(const char* str, size_t len) : str_(str, len) {}
+
+  public:
+  private:
     StringHolder(const std::initializer_list<std::string> args) {
         str_ = std::accumulate(args.begin(), args.end(), str_);
     }
+
+  public:
+  private:
     StringHolder(const StringHolder& other) = default;
+
+  public:
+  private:
     StringHolder(StringHolder&& old) noexcept = default;
+
+  public:
     virtual ~StringHolder() = default;
 
     StringHolder& operator=(StringHolder&& old) noexcept = default;
@@ -83,18 +117,19 @@ class StringHolder {
     const std::string& str() {
         return str_;
     }
-    const std::string& str() const {
+    [[nodiscard]] const std::string& str() const {
         return str_;
     }
-    const char* c_str() const {
+    [[nodiscard]] const char* c_str() const {
         return str_.c_str();
     }
-    const char* data() const {
+    [[nodiscard]] const char* data() const {
         return str_.data();
     }
 
   protected:
-    std::string str_{};
+    std::string str_;
+    friend T;
 };
 
 template <class T>
@@ -106,11 +141,8 @@ std::ostream& operator<<(std::ostream& os, const StringHolder<T>& s) {
 class Url : public StringHolder<Url> {
   public:
     Url() = default;
-    // NOLINTNEXTLINE(google-explicit-constructor, hicpp-explicit-conversions)
-    Url(const std::string& url) : StringHolder<Url>(url) {}
-    // NOLINTNEXTLINE(google-explicit-constructor, hicpp-explicit-conversions)
-    Url(std::string&& url) : StringHolder<Url>(std::move(url)) {}
-    // NOLINTNEXTLINE(google-explicit-constructor, hicpp-explicit-conversions)
+    Url(std::string url) : StringHolder<Url>(std::move(url)) {}
+    Url(std::string_view url) : StringHolder<Url>(url) {}
     Url(const char* url) : StringHolder<Url>(url) {}
     Url(const char* str, size_t len) : StringHolder<Url>(std::string(str, len)) {}
     Url(const std::initializer_list<std::string> args) : StringHolder<Url>(args) {}

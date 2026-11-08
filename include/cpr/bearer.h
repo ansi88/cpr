@@ -1,10 +1,12 @@
 #ifndef CPR_BEARER_H
 #define CPR_BEARER_H
 
-#include <string>
 #include <curl/curlver.h>
+#include <string>
 
 #include <utility>
+
+#include "cpr/util.h"
 
 namespace cpr {
 
@@ -13,10 +15,7 @@ namespace cpr {
 #if LIBCURL_VERSION_NUM >= 0x073D00
 class Bearer {
   public:
-    // NOLINTNEXTLINE(google-explicit-constructor, hicpp-explicit-conversions)
-    Bearer(const std::string& token) : token_string_{token} {}
-    // NOLINTNEXTLINE(google-explicit-constructor, hicpp-explicit-conversions)
-    Bearer(std::string&& token) : token_string_{std::move(token)} {}
+    Bearer(std::string_view token) : token_string_{token} {}
     Bearer(const Bearer& other) = default;
     Bearer(Bearer&& old) noexcept = default;
     virtual ~Bearer() noexcept = default;
@@ -24,10 +23,12 @@ class Bearer {
     Bearer& operator=(Bearer&& old) noexcept = default;
     Bearer& operator=(const Bearer& other) = default;
 
-    virtual const char* GetToken() const noexcept;
+    [[nodiscard]] virtual const char* GetToken() const noexcept {
+        return token_string_.c_str();
+    }
 
   protected:
-    std::string token_string_;
+    util::SecureString token_string_;
 };
 #endif
 

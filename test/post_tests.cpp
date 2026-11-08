@@ -1,18 +1,172 @@
+#include <chrono>
+#include <cstddef>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 
-#include <cpr/cpr.h>
-#include <cpr/multipart.h>
+#include "cpr/cookies.h"
+#include "cpr/multipart.h"
 
 #include "httpServer.hpp"
 
 using namespace cpr;
 
 static HttpServer* server = new HttpServer();
+
+namespace {
+struct StreamState {
+    std::string data;
+    size_t position{0};
+};
+
+MultipartStream MakeMultipartStream(std::string data, std::string filename = {}, bool known_size = true, bool seekable = true) {
+    auto state = std::make_shared<StreamState>(StreamState{std::move(data)});
+    ReadCallback read{known_size ? static_cast<cpr_off_t>(state->data.size()) : -1, [state](char* buffer, size_t& size, intptr_t) {
+                          size = (std::min)({size, size_t{17}, state->data.size() - state->position});
+                          std::memcpy(buffer, state->data.data() + state->position, size);
+                          state->position += size;
+                          return true;
+                      }};
+    MultipartStream::SeekFunction seek;
+    if (seekable) {
+        seek = [state](cpr_off_t offset, int origin) {
+            if (origin != SEEK_SET || offset < 0 || static_cast<size_t>(offset) > state->data.size()) {
+                return false;
+            }
+            state->position = static_cast<size_t>(offset);
+            return true;
+        };
+    }
+    return MultipartStream{std::move(read), std::move(filename), std::move(seek)};
+}
+} // namespace
+
+TEST(MultipartStreamTests, MixedPartsAndIncrementalReads) {
+    const std::string data(4096, 'x');
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"field", "value"}, Part{"file", MakeMultipartStream(data, "stream.bin"), "application/octet-stream"}, Part{"other", MakeMultipartStream("second")}}});
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ("{\n  \"field\": \"value\",\n  \"file\": \"stream.bin=" + data + "\",\n  \"other\": \"second\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, UnknownLengthAndEmptyBody) {
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"file", MakeMultipartStream("unknown length", "", false)}, Part{"empty", MakeMultipartStream("")}}});
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ("{\n  \"file\": \"unknown length\",\n  \"empty\": \"\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, AsyncOwnsTemporaryCallbacks) {
+    auto response = cpr::PostAsync(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"file", MakeMultipartStream("async data", "async.txt")}}}).get();
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ("{\n  \"file\": \"async.txt=async data\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, RedirectRewindsPart) {
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/temporary_redirect.html"}, Multipart{{Part{"file", MakeMultipartStream("redirect data", "file.txt")}}}, Header{{"RedirectLocation", "post_file_upload.html"}}, Redirect{PostRedirectFlags::POST_ALL});
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ("{\n  \"file\": \"file.txt=redirect data\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, NonSeekableRedirectFails) {
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/temporary_redirect.html"}, Multipart{{Part{"file", MakeMultipartStream("redirect data", "", true, false)}}}, Header{{"RedirectLocation", "post_file_upload.html"}}, Redirect{PostRedirectFlags::POST_ALL});
+    EXPECT_NE(ErrorCode::OK, response.error.code);
+}
+
+TEST(MultipartStreamTests, ReadFailureAndExceptionAbort) {
+    for (bool throws : {false, true}) {
+        SCOPED_TRACE(throws);
+        MultipartStream stream{ReadCallback{[throws](char*, size_t&, intptr_t) -> bool {
+            if (throws) {
+                throw std::runtime_error("read failed");
+            }
+            return false;
+        }}};
+        const Response response = cpr::Post(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"file", std::move(stream)}}});
+        EXPECT_EQ(ErrorCode::ABORTED_BY_CALLBACK, response.error.code);
+    }
+}
+
+TEST(MultipartStreamTests, BinaryBytes) {
+    const std::string data{"a\0b%\xff", 6};
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"file", MakeMultipartStream(data, "binary.dat")}}});
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ("{\n  \"file\": \"binary.dat=" + data + "\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, CallbackResourcesReleasedOnRemoveContent) {
+    std::weak_ptr<StreamState> resource;
+    {
+        Session session;
+        session.SetUrl(Url{server->GetBaseUrl() + "/post_file_upload.html"});
+        {
+            auto state = std::make_shared<StreamState>(StreamState{"owned data"});
+            resource = state;
+            ReadCallback read{static_cast<cpr_off_t>(state->data.size()), [state](char* buffer, size_t& size, intptr_t) {
+                                  size = (std::min)(size, state->data.size() - state->position);
+                                  std::memcpy(buffer, state->data.data() + state->position, size);
+                                  state->position += size;
+                                  return true;
+                              }};
+            session.SetMultipart(Multipart{{Part{"file", MultipartStream{std::move(read)}}}});
+        }
+        EXPECT_FALSE(resource.expired());
+        EXPECT_EQ(ErrorCode::OK, session.Post().error.code);
+        session.RemoveContent();
+        EXPECT_TRUE(resource.expired());
+    }
+    EXPECT_TRUE(resource.expired());
+}
+
+TEST(MultipartStreamTests, InvalidByteCountAborts) {
+    MultipartStream stream{ReadCallback{[](char*, size_t& size, intptr_t) {
+        ++size;
+        return true;
+    }}};
+    const Response response = cpr::Post(Url{server->GetBaseUrl() + "/post_file_upload.html"}, Multipart{{Part{"file", std::move(stream)}}});
+    EXPECT_EQ(ErrorCode::ABORTED_BY_CALLBACK, response.error.code);
+}
+
+TEST(MultipartStreamTests, SeekFailureAndExceptionFailRewind) {
+    for (bool throws : {false, true}) {
+        SCOPED_TRACE(throws);
+        auto stream = MakeMultipartStream("redirect data");
+        stream.seek = [throws](cpr_off_t, int) -> bool {
+            if (throws) {
+                throw std::runtime_error("seek failed");
+            }
+            return false;
+        };
+        const Response response = cpr::Post(Url{server->GetBaseUrl() + "/temporary_redirect.html"}, Multipart{{Part{"file", std::move(stream)}}}, Header{{"RedirectLocation", "post_file_upload.html"}}, Redirect{PostRedirectFlags::POST_ALL}, Timeout{1000});
+        EXPECT_EQ(ErrorCode::SEND_FAIL_REWIND, response.error.code);
+    }
+}
+
+TEST(MultipartStreamTests, SessionReplacesStream) {
+    Session session;
+    session.SetTimeout(Timeout{1000});
+    session.SetUrl(Url{server->GetBaseUrl() + "/post_file_upload.html"});
+    session.SetMultipart(Multipart{{Part{"file", MakeMultipartStream("first")}}});
+    EXPECT_EQ("{\n  \"file\": \"first\"\n}", session.Post().text);
+    session.SetMultipart(Multipart{{Part{"file", MakeMultipartStream("second")}}});
+    const auto response = session.Post();
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ("{\n  \"file\": \"second\"\n}", response.text);
+}
+
+TEST(MultipartStreamTests, RejectInvalidReader) {
+    EXPECT_THROW((MultipartStream{ReadCallback{}}), std::invalid_argument);
+    EXPECT_THROW((MultipartStream{ReadCallback{-2, [](char*, size_t&, intptr_t) { return true; }}}), std::invalid_argument);
+}
 
 TEST(UrlEncodedPostTests, UrlPostSingleTest) {
     Url url{server->GetBaseUrl() + "/url_post.html"};
@@ -116,7 +270,8 @@ TEST(UrlEncodedPostTests, UrlPostBadHostTest) {
     EXPECT_EQ(url, response.url);
     EXPECT_EQ(std::string{}, response.header["content-type"]);
     EXPECT_EQ(0, response.status_code);
-    EXPECT_EQ(ErrorCode::HOST_RESOLUTION_FAILURE, response.error.code);
+    // Sometimes the DNS server returns a fake address instead of an NXDOMAIN response, leading to COULDNT_CONNECT.
+    EXPECT_TRUE(response.error.code == ErrorCode::COULDNT_RESOLVE_HOST || response.error.code == ErrorCode::COULDNT_CONNECT);
 }
 
 TEST(UrlEncodedPostTests, FormPostSingleTest) {
@@ -124,7 +279,7 @@ TEST(UrlEncodedPostTests, FormPostSingleTest) {
     Response response = cpr::Post(url, Multipart{{"x", 5}});
     std::string expected_text{
             "{\n"
-            "  \"x\": 5\n"
+            "  \"x\": \"5\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -144,9 +299,188 @@ TEST(UrlEncodedPostTests, FormPostFileTest) {
     Response response = cpr::Post(url, Multipart{{"x", File{filename}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             content +
-            "\n"
+            "\"\n"
+            "}"};
+    std::remove(filename.c_str());
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(UrlEncodedPostTests, FormPostMultipleFilesTestLvalue) {
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+    std::string filename1{"file1"};
+    std::string content1{"apple"};
+    std::ofstream file1;
+    file1.open(filename1);
+    file1 << content1;
+    file1.close();
+    std::string filename2{"file2"};
+    std::string content2{"banana"};
+    std::ofstream file2;
+    file2.open(filename2);
+    file2 << content2;
+    file2.close();
+    File singleFile{"file1"};
+    File singleFileWithOverridenFilename{"file1", "applefile"};
+    Files multipleFiles{"file1", "file2"};
+    Files multipleFilesWithOverridenFilename{
+            File{"file1", "applefile"},
+            File{"file2", "bananafile"},
+    };
+    {
+        Response response = cpr::Post(url, Multipart{{"files", singleFile}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"file1=" +
+                content1 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"singleFile", singleFileWithOverridenFilename}});
+        std::string expected_text{
+                "{\n"
+                "  \"singleFile\": \"applefile=" +
+                content1 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"files", multipleFiles}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"file1=" +
+                content1 +
+                "\",\n"
+                "  \"files\": \"file2=" +
+                content2 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"files", multipleFilesWithOverridenFilename}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"applefile=" +
+                content1 +
+                "\",\n"
+                "  \"files\": \"bananafile=" +
+                content2 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    std::remove(filename1.c_str());
+    std::remove(filename2.c_str());
+}
+
+TEST(UrlEncodedPostTests, FormPostMultipleFilesTestRvalue) {
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+    std::string filename1{"file1"};
+    std::string content1{"apple"};
+    std::ofstream file1;
+    file1.open(filename1);
+    file1 << content1;
+    file1.close();
+    std::string filename2{"file2"};
+    std::string content2{"banana"};
+    std::ofstream file2;
+    file2.open(filename2);
+    file2 << content2;
+    file2.close();
+    {
+        Response response = cpr::Post(url, Multipart{{"files", File{"file1"}}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"file1=" +
+                content1 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"files", File{"file1", "applefile"}}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"applefile=" +
+                content1 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"files", Files{"file1", "file2"}}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"file1=" +
+                content1 +
+                "\",\n"
+                "  \"files\": \"file2=" +
+                content2 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    {
+        Response response = cpr::Post(url, Multipart{{"files", Files{
+                                                                       File{"file1", "applefile"},
+                                                                       File{"file2", "bananafile"},
+                                                               }}});
+        std::string expected_text{
+                "{\n"
+                "  \"files\": \"applefile=" +
+                content1 +
+                "\",\n"
+                "  \"files\": \"bananafile=" +
+                content2 + "\"\n}"};
+        EXPECT_EQ(expected_text, response.text);
+        EXPECT_EQ(url, response.url);
+        EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+        EXPECT_EQ(201, response.status_code);
+        EXPECT_EQ(ErrorCode::OK, response.error.code);
+    }
+    std::remove(filename1.c_str());
+    std::remove(filename2.c_str());
+}
+
+TEST(UrlEncodedPostTests, FormPostFileTestWithOverridenFilename) {
+    std::string filename{"test_file"};
+    std::string overided_filename{"overided_filename"};
+    std::string content{"hello world"};
+    std::ofstream test_file;
+    test_file.open(filename);
+    test_file << content;
+    test_file.close();
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+
+    Response response = cpr::Post(url, Multipart{{"x", File{filename, overided_filename}}});
+    std::string expected_text{
+            "{\n"
+            "  \"x\": \"" +
+            overided_filename + "=" + content +
+            "\"\n"
             "}"};
     std::remove(filename.c_str());
     EXPECT_EQ(expected_text, response.text);
@@ -157,7 +491,7 @@ TEST(UrlEncodedPostTests, FormPostFileTest) {
 }
 
 TEST(UrlEncodedPostTests, FormPostFileNoCopyTest) {
-    std::string filename{"test_file"};
+    std::string filename{"./test_file"};
     std::string content{"hello world"};
     std::ofstream test_file;
     test_file.open(filename);
@@ -168,9 +502,9 @@ TEST(UrlEncodedPostTests, FormPostFileNoCopyTest) {
     Response response = cpr::Post(url, multipart);
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             content +
-            "\n"
+            "\"\n"
             "}"};
     std::remove(filename.c_str());
     EXPECT_EQ(expected_text, response.text);
@@ -180,12 +514,44 @@ TEST(UrlEncodedPostTests, FormPostFileNoCopyTest) {
     EXPECT_EQ(ErrorCode::OK, response.error.code);
 }
 
+TEST(UrlEncodedPostTests, FormPostFileNoCopyTestWithOverridenFilename) {
+    std::string filename{"test_file"};
+    std::string overriden_filename{"overided_filename"};
+    std::string content{"hello world"};
+    std::ofstream test_file;
+    test_file.open(filename);
+    test_file << content;
+    test_file.close();
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+    Multipart multipart{{"x", File{filename, overriden_filename}}};
+    Response response = cpr::Post(url, multipart);
+    std::string expected_text{
+            "{\n"
+            "  \"x\": \"" +
+            overriden_filename + "=" + content +
+            "\"\n"
+            "}"};
+    std::remove(filename.c_str());
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(UrlEncodedPostTests, JsonPostPreservesPercentSigns) {
+    Url url{server->GetBaseUrl() + "/json_post.html"};
+    std::string body{R"({"value":"100%% complete"})"};
+    Response response = cpr::Post(url, Header{{"Content-Type", "application/json"}}, Body{body});
+    EXPECT_EQ(body, response.text);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
 TEST(UrlEncodedPostTests, TimeoutPostTest) {
     Url url{server->GetBaseUrl() + "/json_post.html"};
     std::string body{R"({"RegisterObject": {"DeviceID": "65010000005030000001"}})"};
-    cpr::Response response =
-            cpr::Post(url, cpr::Header{{"Content-Type", "application/json"}}, cpr::Body{body},
-                      cpr::ConnectTimeout{3000}, cpr::Timeout{3000});
+    cpr::Response response = cpr::Post(url, cpr::Header{{"Content-Type", "application/json"}}, cpr::Body{body}, cpr::ConnectTimeout{3000}, cpr::Timeout{3000});
     std::string expected_text{R"({"RegisterObject": {"DeviceID": "65010000005030000001"}})"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -197,13 +563,12 @@ TEST(UrlEncodedPostTests, TimeoutPostTest) {
 TEST(UrlEncodedPostTests, FormPostFileBufferTest) {
     std::string content{"hello world"};
     Url url{server->GetBaseUrl() + "/form_post.html"};
-    Response response =
-            cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             content +
-            "\n"
+            "\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -219,9 +584,9 @@ TEST(UrlEncodedPostTests, FormPostFileBufferNoCopyTest) {
     Response response = cpr::Post(url, multipart);
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             content +
-            "\n"
+            "\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -233,13 +598,12 @@ TEST(UrlEncodedPostTests, FormPostFileBufferNoCopyTest) {
 TEST(UrlEncodedPostTests, FormPostFileBufferPointerTest) {
     const char* content = "hello world";
     Url url{server->GetBaseUrl() + "/form_post.html"};
-    Response response =
-            cpr::Post(url, Multipart{{"x", Buffer{content, 11 + content, "test_file"}}});
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{content, 11 + content, "test_file"}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             std::string(content) +
-            "\n"
+            "\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -252,13 +616,12 @@ TEST(UrlEncodedPostTests, FormPostFileBufferArrayTest) {
     const char content[] = "hello world";
     Url url{server->GetBaseUrl() + "/form_post.html"};
     // We subtract 1 from std::end() because we don't want to include the terminating null
-    Response response = cpr::Post(
-            url, Multipart{{"x", Buffer{std::begin(content), std::end(content) - 1, "test_file"}}});
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{std::begin(content), std::end(content) - 1, "test_file"}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": " +
+            "  \"x\": \"test_file=" +
             std::string(content) +
-            "\n"
+            "\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -270,11 +633,10 @@ TEST(UrlEncodedPostTests, FormPostFileBufferArrayTest) {
 TEST(UrlEncodedPostTests, FormPostFileBufferVectorTest) {
     std::vector<unsigned char> content{'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
     Url url{server->GetBaseUrl() + "/form_post.html"};
-    Response response =
-            cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": hello world\n"
+            "  \"x\": \"test_file=hello world\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -286,11 +648,41 @@ TEST(UrlEncodedPostTests, FormPostFileBufferVectorTest) {
 TEST(UrlEncodedPostTests, FormPostFileBufferStdArrayTest) {
     std::array<unsigned char, 11> content{{'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'}};
     Url url{server->GetBaseUrl() + "/form_post.html"};
-    Response response =
-            cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
     std::string expected_text{
             "{\n"
-            "  \"x\": hello world\n"
+            "  \"x\": \"test_file=hello world\"\n"
+            "}"};
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(UrlEncodedPostTests, FormPostBufferRvalueTest) {
+    std::vector<unsigned char> content{'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+    Response response = cpr::Post(url, Multipart{{"x", Buffer{content.begin(), content.end(), "test_file"}}});
+    std::string expected_text{
+            "{\n"
+            "  \"x\": \"test_file=hello world\"\n"
+            "}"};
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(UrlEncodedPostTests, ReflectPostBufferLvalueTest) {
+    std::vector<unsigned char> content{'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
+    Url url{server->GetBaseUrl() + "/form_post.html"};
+    Buffer buff{content.begin(), content.end(), "test_file"};
+    Response response = cpr::Post(url, Multipart{{"x", buff}});
+    std::string expected_text{
+            "{\n"
+            "  \"x\": \"test_file=hello world\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -304,9 +696,8 @@ TEST(UrlEncodedPostTests, FormPostManyTest) {
     Response response = cpr::Post(url, Multipart{{"x", 5}, {"y", 13}});
     std::string expected_text{
             "{\n"
-            "  \"x\": 5,\n"
-            "  \"y\": 13,\n"
-            "  \"sum\": 18\n"
+            "  \"x\": \"5\",\n"
+            "  \"y\": \"13\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -321,9 +712,8 @@ TEST(UrlEncodedPostTests, FormPostManyNoCopyTest) {
     Response response = cpr::Post(url, multipart);
     std::string expected_text{
             "{\n"
-            "  \"x\": 5,\n"
-            "  \"y\": 13,\n"
-            "  \"sum\": 18\n"
+            "  \"x\": \"5\",\n"
+            "  \"y\": \"13\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -337,7 +727,7 @@ TEST(UrlEncodedPostTests, FormPostContentTypeTest) {
     Response response = cpr::Post(url, Multipart{{"x", 5, "application/number"}});
     std::string expected_text{
             "{\n"
-            "  \"x\": 5\n"
+            "  \"x\": \"5\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -352,7 +742,7 @@ TEST(UrlEncodedPostTests, FormPostContentTypeLValueTest) {
     Response response = cpr::Post(url, multipart);
     std::string expected_text{
             "{\n"
-            "  \"x\": 5\n"
+            "  \"x\": \"5\"\n"
             "}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
@@ -395,10 +785,7 @@ TEST(UrlEncodedPostTests, UrlReflectTest) {
 TEST(UrlEncodedPostTests, PostWithNoBodyTest) {
     Url url{server->GetBaseUrl() + "/form_post.html"};
     Response response = cpr::Post(url);
-    std::string expected_text{
-            "{\n"
-            "  \"x\": \n"
-            "}"};
+    std::string expected_text{"{\n}"};
     EXPECT_EQ(expected_text, response.text);
     EXPECT_EQ(url, response.url);
     EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
@@ -407,27 +794,28 @@ TEST(UrlEncodedPostTests, PostWithNoBodyTest) {
 }
 
 static std::string getTimestamp() {
-    char buf[1000];
-    time_t now = time(0);
-    struct tm* tm = gmtime(&now);
-    strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", tm);
+    const std::chrono::system_clock::time_point tp = std::chrono::system_clock::now();
+    const time_t timeT = std::chrono::system_clock::to_time_t(tp);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    struct tm* tm = gmtime(&timeT);
+
+    std::string buf;
+    buf.resize(EXPIRES_STRING_SIZE);
+
+    const size_t s = strftime(buf.data(), buf.size(), "%a, %d %b %Y %H:%M:%S GMT", tm);
+    EXPECT_GT(s, 0);
+    buf.resize(s);
     return buf;
 }
 
 TEST(UrlEncodedPostTests, PostReflectTest) {
-    std::string uri = server->GetBaseUrl() + "/reflect_post.html";
+    std::string uri = server->GetBaseUrl() + "/post_reflect.html";
     std::string body = R"({"property1": "value1"})";
     std::string contentType = "application/json";
     std::string signature = "x-ms-date: something";
     std::string logType = "LoggingTest";
     std::string date = getTimestamp();
-    Response response = cpr::Post(cpr::Url(uri),
-                                  cpr::Header{{"content-type", contentType},
-                                              {"Authorization", signature},
-                                              {"log-type", logType},
-                                              {"x-ms-date", date},
-                                              {"content-length", std::to_string(body.length())}},
-                                  cpr::Body(body));
+    Response response = cpr::Post(cpr::Url(uri), cpr::Header{{"content-type", contentType}, {"Authorization", signature}, {"log-type", logType}, {"x-ms-date", date}, {"content-length", std::to_string(body.length())}}, cpr::Body(body));
     EXPECT_EQ(ErrorCode::OK, response.error.code);
     EXPECT_EQ(200, response.status_code);
     EXPECT_EQ(body, response.text);
@@ -445,6 +833,109 @@ TEST(UrlEncodedPostTests, PostReflectPayloadTest) {
 
     EXPECT_EQ(ErrorCode::OK, response.error.code);
     EXPECT_EQ(200, response.status_code);
+}
+
+TEST(UrlEncodedPostTests, InjectMultipleHeadersTest) {
+    std::string uri = server->GetBaseUrl() + "/post_reflect.html";
+    std::string key_1 = "key_1";
+    std::string val_1 = "value_1";
+    std::string key_2 = "key_2";
+    std::string val_2 = "value_2";
+    cpr::Response response = cpr::Post(cpr::Url{uri}, cpr::Header{{key_1, val_1}}, cpr::Header{{key_2, val_2}});
+
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_EQ(val_1, response.header[key_1]);
+    EXPECT_EQ(val_2, response.header[key_2]);
+}
+
+TEST(UrlEncodedPostTests, PostBodyWithFile) {
+    std::string filename{"test_file"};
+    std::string expected_text(R"({"property1": "value1"})");
+    std::ofstream test_file;
+    test_file.open(filename);
+    test_file << expected_text;
+    test_file.close();
+    Url url{server->GetBaseUrl() + "/post_reflect.html"};
+    cpr::Response response = Post(url, cpr::Header({{"Content-Type", "application/octet-stream"}}), cpr::Body(File("test_file")));
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+    EXPECT_EQ(std::string{"application/octet-stream"}, response.header["content-type"]);
+    EXPECT_EQ(200, response.status_code);
+}
+
+TEST(UrlEncodedPostTests, PostBodyWithBuffer) {
+    Url url{server->GetBaseUrl() + "/post_reflect.html"};
+    std::string expected_text(R"({"property1": "value1"})");
+    cpr::Response response = Post(url, cpr::Header({{"Content-Type", "application/octet-stream"}}), cpr::Body(Buffer{expected_text.begin(), expected_text.end(), "test_file"}));
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(url, response.url);
+    EXPECT_EQ(std::string{"application/octet-stream"}, response.header["content-type"]);
+    EXPECT_EQ(200, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, TempRedirectTest) {
+    Url url{server->GetBaseUrl() + "/temporary_redirect.html"};
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}}, Redirect(PostRedirectFlags::POST_ALL));
+    std::string expected_text{
+            "{\n"
+            "  \"x\": 5\n"
+            "}"};
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, TempRedirectNoneTest) {
+    Url url{server->GetBaseUrl() + "/temporary_redirect.html"};
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}}, Redirect(PostRedirectFlags::NONE));
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(405, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, PermRedirectTest) {
+    Url url{server->GetBaseUrl() + "/permanent_redirect.html"};
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}}, Redirect(PostRedirectFlags::POST_ALL));
+    std::string expected_text{
+            "{\n"
+            "  \"x\": 5\n"
+            "}"};
+    EXPECT_EQ(expected_text, response.text);
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(std::string{"application/json"}, response.header["content-type"]);
+    EXPECT_EQ(201, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, PermRedirectNoneTest) {
+    Url url{server->GetBaseUrl() + "/permanent_redirect.html"};
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}}, Redirect(PostRedirectFlags::NONE));
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(405, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, TempRedirectDefaultTest) {
+    Url url{server->GetBaseUrl() + "/temporary_redirect.html"};
+    // Default PostRedirectFlags is NONE, so POST should not be preserved on redirect
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}});
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(405, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
+}
+
+TEST(PostRedirectTests, PermRedirectDefaultTest) {
+    Url url{server->GetBaseUrl() + "/permanent_redirect.html"};
+    // Default PostRedirectFlags is NONE, so POST should not be preserved on redirect
+    Response response = cpr::Post(url, Payload{{"x", "5"}}, Header{{"RedirectLocation", "url_post.html"}});
+    EXPECT_EQ(response.url, server->GetBaseUrl() + "/url_post.html");
+    EXPECT_EQ(405, response.status_code);
+    EXPECT_EQ(ErrorCode::OK, response.error.code);
 }
 
 int main(int argc, char** argv) {

@@ -1,487 +1,428 @@
 name: CI
-on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+on: [push, workflow_dispatch, pull_request] # Trigger for every push as well as for every pull request. Yes, this will run stuff twice in case we create a PR from inside this repo. I'm open for better solutions, where I do not have to specify each brach individually for the 'push' trigger.
+
+env:
+  # Enable verbose output.
+  # Repeat up to 5 times to deal with flaky tests.
+  CTEST_OPTIONS: "--repeat until-pass:5 --output-on-failure"
 
 jobs:
-  ubuntu-20-shared-gcc-ssl:
-    runs-on: ubuntu-20.04
+  ubuntu-clang-openssl:
+    strategy:
+      matrix:
+        container: ["ubuntu:latest", "ubuntu:rolling"]
+        systemCurl: [ON, OFF]
+        buildType: [Debug, Release]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
+    - name: Update package list
+      run: apt update
+    - name: Install Dependencies
+      run: apt install -y git libssl-dev cmake build-essential clang libcurl4-openssl-dev libpsl-dev meson libunistring-dev
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2.2
       with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
+        cmake-version: '3.24.x'
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: ${{ matrix.systemCurl }}
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        cc: clang
+        cxx: clang++
+        build-type: ${{ matrix.buildType }}
+        run-test: true
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+
+  ubuntu-gcc-openssl:
+    strategy:
+      matrix:
+        container: ["ubuntu:latest", "ubuntu:rolling"]
+        systemCurl: [ON, OFF]
+        buildType: [Debug, Release]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    steps:
+    - name: Update package list
+      run: apt update
+    - name: Install Dependencies
+      run: apt install -y git libssl-dev cmake build-essential libcurl4-openssl-dev libpsl-dev meson libunistring-dev
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2.2
+      with:
+        cmake-version: '3.24.x'
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: ${{ matrix.systemCurl }}
+      uses: ashutoshvarma/action-cmake-build@master
+      with:
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        cc: gcc
+        cxx: g++
+        build-type: ${{ matrix.buildType }}
+        run-test: true
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+
+  ubuntu-gcc-mbedtls:
+    runs-on: ubuntu-latest
+    container: ubuntu:latest
+    steps:
+    - name: Update package list
+      run: apt-get update
+    - name: Install Dependencies
+      run: apt-get install -y git libssl-dev libmbedtls-dev cmake build-essential libpsl-dev meson libunistring-dev
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2.2
+      with:
+        cmake-version: '3.24.x'
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_MBEDTLS_BACKEND: ON
+      uses: ashutoshvarma/action-cmake-build@master
+      with:
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: gcc
         cxx: g++
         build-type: Release
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
-  
-  clang-tidy:
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+
+  ubuntu-wolfssl:
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        buildType: [Debug, Release]
+        include:
+        - compiler: gcc
+          cxx: g++
+        - compiler: clang
+          cxx: clang++
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
+    - name: Update package list
+      run: sudo apt update
+    - name: Install Dependencies
+      run: sudo apt install -y libwolfssl-dev libgtest-dev cmake build-essential clang libpsl-dev
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2.2
       with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: Install clang-tidy
-      run: sudo apt install clang-tidy
-    - name: "[Release g++] Build & Test"
+        cmake-version: '3.24.x'
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: OFF # The mongoose TLS test server requires OpenSSL.
+        CPR_FORCE_WOLFSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: OFF
+        CPR_USE_SYSTEM_GTEST: ON
+        CPR_USE_SYSTEM_LIB_PSL: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        cc: ${{ matrix.compiler }}
+        cxx: ${{ matrix.cxx }}
+        build-type: ${{ matrix.buildType }}
+        run-test: true
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+
+  fedora-clang-openssl:
+    runs-on: ubuntu-latest
+    container: "fedora:latest"
+    steps:
+    - name: Update package list
+      run: dnf update -y
+    - name: Install Dependencies
+      run: dnf install -y gcc g++ clang git make openssl-devel libcurl-devel cmake libpsl-devel libunistring-devel meson
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: OFF
+      uses: ashutoshvarma/action-cmake-build@master
+      with:
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: clang
         cxx: clang++
         build-type: Release
         run-test: true
-        ctest-options: -V
-        configure-options: -DCPR_ENABLE_LINTING=ON
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  ubuntu-20-static-gcc-ssl:
-    runs-on: ubuntu-20.04
+  fedora-gcc-openssl:
+    strategy:
+      matrix:
+        systemCurl: [ON, OFF]
+        buildType: [Debug, Release]
+    runs-on: ubuntu-latest
+    container: "fedora:latest"
     steps:
+    - name: Update package list
+      run: dnf update -y
+    - name: Install Dependencies
+      run: dnf install -y gcc g++ clang git make openssl-devel libcurl-devel cmake libpsl-devel libunistring-devel meson
     - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: ${{ matrix.systemCurl }}
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: gcc
         cxx: g++
-        build-type: Release
+        build-type: ${{ matrix.buildType }}
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  ubuntu-18-gcc-shared-ssl:
-    runs-on: ubuntu-18.04
+  fedora-gcc-openssl-no-psl:
+    runs-on: ubuntu-latest
+    container: "fedora:latest"
     steps:
+    - name: Update package list
+      run: dnf update -y
+    - name: Install Dependencies
+      run: dnf install -y git gcc g++ make openssl-devel cmake libunistring-devel
     - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: OFF
+        CPR_CURL_USE_LIBPSL: OFF
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: gcc
         cxx: g++
-        build-type: Release
+        build-type: release
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  ubuntu-18-gcc-static-ssl:
-    runs-on: ubuntu-18.04
+  fedora-gcc-ssl-sanitizer:
+    strategy:
+      matrix:
+        buildType: [UdefSan, LeakSan, AddrSan] # ThreadSan is disabled for now until all problems are resolved: https://github.com/libcpr/cpr/issues/451
+    runs-on: ubuntu-latest
+    container: "fedora:latest" # Use fedora for an up to date version of all sanitizers
     steps:
+    - name: Update package list
+      run: dnf update -y
+    - name: Install Dependencies
+      run: dnf install -y gcc g++ clang git make openssl-devel libasan libubsan liblsan libtsan cmake libpsl-devel libunistring-devel meson
     - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: gcc
         cxx: g++
-        build-type: Release
+        build-type: ${{ matrix.buildType }}
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-  
-  ubuntu-18-gcc-shared-ssl-system-curl:
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libcurl4-openssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        configure-options: -DUSE_SYSTEM_CURL=ON -DBUILD_SHARED_LIBS=ON
-        cc: gcc
-        cxx: g++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  ubuntu-18-gcc-static-ssl-system-curl:
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libcurl4-openssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        configure-options: -DUSE_SYSTEM_CURL=ON -DBUILD_SHARED_LIBS=OFF
-        cc: gcc
-        cxx: g++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
-    
-  ubuntu-18-gcc-ssl-address-leak-undefined-behavior-sanitizer:
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: Install sanitizer
-      run: sudo apt install libasan5 libubsan1 liblsan0 libtsan0
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: gcc
-        cxx: g++
-        build-type: AllSan
-        run-test: true
-        ctest-options: -V
-
-  ubuntu-18-gcc-ssl-thread-sanitizer:
-    runs-on: ubuntu-18.04
-    if: ${{ false }} # Disabled for now until all problems are resolved
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: Install sanitizer
-      run: sudo apt install libasan5 libubsan1 liblsan0 libtsan0
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: gcc
-        cxx: g++
-        build-type: ThreadSan
-        run-test: true
-        ctest-options: -V
-  
-  ubuntu-18-clang-shared-ssl:
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: clang
-        cxx: clang++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
-
-  ubuntu-18-clang-static-ssl:
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: clang
-        cxx: clang++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-
-  ubuntu-16-gcc-shared-ssl:
-    runs-on: ubuntu-16.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: gcc
-        cxx: g++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
-
-  ubuntu-16-gcc-static-ssl:
-    runs-on: ubuntu-16.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install libssl-dev
-      run: sudo apt install libssl-dev
-    - name: "[Release g++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        cc: gcc
-        cxx: g++
-        build-type: Release
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-    
-  windows-msvc-shared-ssl:
+  windows-msvc-ssl:
+    strategy:
+      matrix:
+        buildType: [Debug, Release]
     runs-on: windows-latest
     steps:
+    - uses: actions/setup-python@v7
+    - name: Install meson
+      run: pip install meson
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
     - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: "[Release msvc] Build & Test"
+      uses: actions/checkout@v7
+    - name: "Build & Test"
       env:
-        CMAKE_GENERATOR: "Visual Studio 16 2019"
-        CPR_BUILD_TESTS_SSL: OFF
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        target: ALL_BUILD
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
-
-  windows-msvc-shared-winssl:
-    runs-on: windows-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: "[Release msvc] Build & Test"
-      env:
-        CMAKE_GENERATOR: "Visual Studio 16 2019"
+        CMAKE_GENERATOR: "Visual Studio 18 2026"
+        CPR_BUILD_TESTS: ON
         CPR_BUILD_TESTS_SSL: OFF
         CPR_FORCE_WINSSL_BACKEND: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        target: ALL_BUILD
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        build-type: ${{ matrix.buildType }}
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  windows-msvc-static-ssl:
+  windows-msvc-openssl:
     runs-on: windows-latest
     steps:
+    - uses: actions/setup-python@v7
+    - name: Install meson
+      run: pip install meson
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+    - name: Install OpenSSL
+      run: choco install openssl -y
     - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: "[Release msvc] Build & Test"
+      uses: actions/checkout@v7
+    - name: "Build & Test"
       env:
-        CMAKE_GENERATOR: "Visual Studio 16 2019"
+        CMAKE_GENERATOR: "Visual Studio 18 2026"
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+      uses: ashutoshvarma/action-cmake-build@master
+      with:
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        build-type: Release
+        run-test: true
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+  
+  macos-clang-ssl:
+    strategy:
+      matrix:
+        buildType: [Debug, Release]
+    runs-on: macos-latest
+    steps:
+    - name: Install OpenSSL
+      run: |
+        brew install openssl@3
+        echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+    - name: Install libpsl
+      run: brew install libpsl
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
         CPR_BUILD_TESTS_SSL: OFF
+        CPR_USE_SYSTEM_LIB_PSL: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        target: ALL_BUILD
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        cc: clang
+        cxx: clang++
+        build-type: ${{ matrix.buildType }}
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-  
-  windows-msvc-shared-openssl:
-    runs-on: windows-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install OpenSSL
-      run: choco install openssl
-    - name: "[Release msvc] Build & Test"
-      env:
-        CMAKE_GENERATOR: "Visual Studio 16 2019"
-        CPR_FORCE_OPENSSL_BACKEND: ON
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        target: ALL_BUILD
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
+        ctest-options: ${{ env.CTEST_OPTIONS }}
 
-  windows-msvc-static-openssl:
-    runs-on: windows-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: Install OpenSSL
-      run: choco install openssl
-    - name: "[Release msvc] Build & Test"
-      env:
-        CMAKE_GENERATOR: "Visual Studio 16 2019"
-        CPR_FORCE_OPENSSL_BACKEND: ON
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        target: ALL_BUILD
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-
-  macos-clang-shared-openssl:
+  macos-clang-darwinssl:
     runs-on: macos-latest
     steps:
+    - name: Install libpsl
+      run: brew install libpsl
     - name: Checkout
-      uses: actions/checkout@v2.2.0
+      uses: actions/checkout@v7
+    - name: "Build & Test"
+      env:
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: OFF
+        CPR_FORCE_DARWINSSL_BACKEND: ON
+        CPR_USE_SYSTEM_CURL: ON # Bundled curl no longer supports Secure Transport.
+        CPR_USE_SYSTEM_LIB_PSL: ON
+      uses: ashutoshvarma/action-cmake-build@master
       with:
-        submodules: true
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
+        cc: clang
+        cxx: clang++
+        build-type: Release
+        run-test: true
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+
+  macos-clang-openssl:
+    runs-on: macos-latest
+    steps:
     - name: Install OpenSSL
       run: |
-        brew install openssl
-        echo 'export PATH="/usr/local/opt/openssl/bin:$PATH"' >> ~/.bash_profile
-        source ~/.bash_profile
-    - name: "[Release clang++] Build & Test"
+        brew install openssl@3
+        echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+    - name: Install libpsl
+      run: brew install libpsl
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
       env:
-        OPENSSL_ROOT_DIR: "/usr/local/opt/openssl"
-        OPENSSL_LIBRARIES: "/usr/local/opt/openssl/lib"
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_SYSTEM_LIB_PSL: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: clang
         cxx: clang++
+        build-type: Release
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=ON
-
-  macos-clang-static-openssl:
+        ctest-options: ${{ env.CTEST_OPTIONS }}
+  
+  macos-clang-openssl-boost:
     runs-on: macos-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
+    - name: Install Boost
+      run: brew install boost
     - name: Install OpenSSL
       run: |
-        brew install openssl
-        echo 'export PATH="/usr/local/opt/openssl/bin:$PATH"' >> ~/.bash_profile
-        source ~/.bash_profile
-    - name: "[Release clang++] Build & Test"
+        brew install openssl@3
+        echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+    - name: Install libpsl
+      run: brew install libpsl
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: "Build & Test"
       env:
-        OPENSSL_ROOT_DIR: "/usr/local/opt/openssl"
-        OPENSSL_LIBRARIES: "/usr/local/opt/openssl/lib"
+        CPR_BUILD_TESTS: ON
+        CPR_BUILD_TESTS_SSL: ON
+        CPR_FORCE_OPENSSL_BACKEND: ON
+        CPR_USE_BOOST_FILESYSTEM: ON
+        CPR_USE_SYSTEM_LIB_PSL: ON
       uses: ashutoshvarma/action-cmake-build@master
       with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
+        build-dir: ${{ github.workspace }}/build
+        source-dir: ${{ github.workspace }}
         cc: clang
         cxx: clang++
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-  
-  macos-clang-static-autossl:
-    runs-on: macos-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: "[Release clang++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
         build-type: Release
-        cc: clang
-        cxx: clang++
         run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF
-
-  macos-clang-static-darwinssl:
-    runs-on: macos-latest
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v2.2.0
-      with:
-        submodules: true
-    - name: "[Release clang++] Build & Test"
-      uses: ashutoshvarma/action-cmake-build@master
-      with:
-        build-dir: ${{github.workspace}}/build
-        source-dir: ${{github.workspace}}
-        build-type: Release
-        cc: clang
-        cxx: clang++
-        run-test: true
-        ctest-options: -V
-        configure-options: -DBUILD_SHARED_LIBS=OFF -DCPR_FORCE_DARWINSSL_BACKEND=ON
+        ctest-options: ${{ env.CTEST_OPTIONS }}

@@ -1,11 +1,33 @@
 #include "httpsServer.hpp"
-#include <system_error>
+#include <fstream>
+#include <ios>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+
+#include "cpr/filesystem.h" // IWYU pragma: keep
+#include "mongoose.h"
+
+// NOLINTNEXTLINE(misc-use-anonymous-namespace) LLVM prefers static functions.
+static std::string LoadTlsFile(const std::string& path) {
+    std::ifstream file{path, std::ios::binary};
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open TLS file: " + path);
+    }
+    std::string content{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    if (file.bad() || content.empty()) {
+        throw std::runtime_error("Failed to read TLS file: " + path);
+    }
+    return content;
+}
 
 namespace cpr {
-HttpsServer::HttpsServer(std::string&& baseDirPath, std::string&& sslCertFileName,
-                         std::string&& sslKeyFileName)
-        : baseDirPath(std::move(baseDirPath)), sslCertFileName(std::move(sslCertFileName)),
-          sslKeyFileName(std::move(sslKeyFileName)) {}
+HttpsServer::HttpsServer(fs::path&& baseDirPath, fs::path&& sslCertFileName, fs::path&& sslKeyFileName) : baseDirPath(baseDirPath.make_preferred().string()), sslCertFileName(sslCertFileName.make_preferred().string()), sslKeyFileName(sslKeyFileName.make_preferred().string()), sslCert(LoadTlsFile(this->sslCertFileName)), sslKey(LoadTlsFile(this->sslKeyFileName)) {
+    // See https://mongoose.ws/tutorials/tls/
+    memset(static_cast<void*>(&tlsOpts), 0, sizeof(tlsOpts));
+    tlsOpts.cert = mg_str(sslCert.c_str());
+    tlsOpts.key = mg_str(sslKey.c_str());
+}
 
 std::string HttpsServer::GetBaseUrl() {
     return "https://127.0.0.1:" + std::to_string(GetPort());
@@ -16,25 +38,20 @@ uint16_t HttpsServer::GetPort() {
     return 61937;
 }
 
-mg_connection* HttpsServer::initServer(mg_mgr* mgr,
-                                       MG_CB(mg_event_handler_t event_handler, void* user_data)) {
-    // https://cesanta.com/docs/http/ssl.html
-    mg_mgr_init(mgr, this);
+mg_connection* HttpsServer::initServer(mg_mgr* mgr, mg_event_handler_t event_handler) {
+    mg_mgr_init(mgr);
 
-    mg_bind_opts bind_opts{};
-    bind_opts.ssl_cert = sslCertFileName.c_str();
-    bind_opts.ssl_key = sslKeyFileName.c_str();
-    std::string port = std::to_string(GetPort());
-    mg_connection* c = mg_bind_opt(mgr, port.c_str(), event_handler, bind_opts);
-    if (!c) {
-        throw std::system_error(errno, std::system_category(), "Failed to bind to port " + port);
-    }
-    mg_set_protocol_http_websocket(c);
+    mg_connection* c = mg_http_listen(mgr, GetBaseUrl().c_str(), event_handler, this);
     return c;
 }
 
-void HttpsServer::OnRequest(mg_connection* conn, http_message* msg) {
-    std::string uri = std::string(msg->uri.p, msg->uri.len);
+void HttpsServer::acceptConnection(mg_connection* conn) {
+    // See https://mongoose.ws/tutorials/tls/
+    mg_tls_init(conn, &tlsOpts);
+}
+
+void HttpsServer::OnRequest(mg_connection* conn, mg_http_message* msg) {
+    std::string uri = std::string(msg->uri.buf, msg->uri.len);
     if (uri == "/hello.html") {
         OnRequestHello(conn, msg);
     } else {
@@ -42,15 +59,14 @@ void HttpsServer::OnRequest(mg_connection* conn, http_message* msg) {
     }
 }
 
-void HttpsServer::OnRequestNotFound(mg_connection* conn, http_message*  /*msg*/) {
-    mg_http_send_error(conn, 404, "Not Found");
+void HttpsServer::OnRequestNotFound(mg_connection* conn, mg_http_message* /*msg*/) {
+    mg_http_reply(conn, 404, nullptr, "Not Found");
 }
 
-void HttpsServer::OnRequestHello(mg_connection* conn, http_message*  /*msg*/) {
+void HttpsServer::OnRequestHello(mg_connection* conn, mg_http_message* /*msg*/) {
     std::string response{"Hello world!"};
-    std::string headers = "Content-Type: text/html";
-    mg_send_head(conn, 200, response.length(), headers.c_str());
-    mg_send(conn, response.c_str(), response.length());
+    std::string headers{"Content-Type: text/html\r\n"};
+    mg_http_reply(conn, 200, headers.c_str(), response.c_str());
 }
 
 const std::string& HttpsServer::getBaseDirPath() const {
